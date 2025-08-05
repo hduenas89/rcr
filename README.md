@@ -14,7 +14,7 @@ Rice Cooker (`rcr`) is a command-line tool for Arch Linux to create configuratio
 ## Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/<your-username>/rcr.git
+   git clone https://github.com/hduenas89/rcr.git
    cd rcr
    ```
 2. Move the script to `~/.local/bin`:
