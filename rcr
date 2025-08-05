@@ -1,0 +1,430 @@
+#!/bin/bash
+
+# Default script location
+DEFAULT_SCRIPT=~/.rice-cooker/config.sh
+SCRIPT_FILE=$DEFAULT_SCRIPT
+AUR_HELPER=${AUR_HELPER:-yay}  # Default to yay, can be overridden by environment variable
+
+# Function to get the last non-rcr command from history
+get_last_command() {
+    local i=2
+    while true; do
+        LAST_CMD=$(fc -ln -$i -$i 2>/dev/null)
+        if [ -z "$LAST_CMD" ]; then
+            echo ""
+            return
+        fi
+        if [[ ! "$LAST_CMD" =~ ^rcr ]]; then
+            echo "$LAST_CMD"
+            return
+        fi
+        ((i++))
+    done
+}
+
+# Function to check and add prerequisites for a category
+add_prerequisites() {
+    local category=$1
+    case $category in
+        arch)
+            echo "# Ensure pacman is up to date" >> "$SCRIPT_FILE"
+            echo "sudo pacman -Syu" >> "$SCRIPT_FILE"
+            ;;
+        aur)
+            if ! command -v "$AUR_HELPER" &>/dev/null; then
+                echo "# Install AUR helper ($AUR_HELPER)" >> "$SCRIPT_FILE"
+                echo "sudo pacman -S --needed git base-devel" >> "$SCRIPT_FILE"
+                echo "git clone https://aur.archlinux.org/$AUR_HELPER.git /tmp/$AUR_HELPER" >> "$SCRIPT_FILE"
+                echo "cd /tmp/$AUR_HELPER && makepkg -si" >> "$SCRIPT_FILE"
+            fi
+            ;;
+        flatpak)
+            if ! command -v flatpak &>/dev/null; then
+                echo "# Install Flatpak" >> "$SCRIPT_FILE"
+                echo "sudo pacman -S --needed flatpak" >> "$SCRIPT_FILE"
+            fi
+            ;;
+    esac
+}
+
+# Function to add bundle commands
+add_bundle() {
+    local category=$1
+    shift
+    local packages=("$@")
+    local install_cmd
+
+    # Add prerequisites for the category
+    add_prerequisites "$category"
+
+    case $category in
+        arch)
+            install_cmd="sudo pacman -S --needed"
+            ;;
+        aur)
+            install_cmd="$AUR_HELPER -S --needed"
+            ;;
+        flatpak)
+            install_cmd="flatpak install -y flathub"
+            ;;
+        *)
+            echo "Error: Invalid bundle category '$category'. Use 'arch', 'aur', or 'flatpak'." >&2
+            exit 1
+            ;;
+    esac
+
+    # Validate packages
+    for pkg in "${packages[@]}"; do
+        case $category in
+            arch)
+                if ! pacman -Si "$pkg" &>/dev/null; then
+                    echo "Warning: Package '$pkg' not found in Arch repositories." >&2
+                fi
+                ;;
+            aur)
+                if ! "$AUR_HELPER" -Si "$pkg" &>/dev/null; then
+                    echo "Warning: Package '$pkg' not found in AUR." >&2
+                fi
+                ;;
+            flatpak)
+                if ! flatpak search "$pkg" &>/dev/null; then
+                    echo "Warning: Flatpak '$pkg' not found in Flathub." >&2
+                fi
+                ;;
+        esac
+    done
+
+    # Add bundle to script with comment
+    echo "# Bundle: $category packages (${packages[*]})" >> "$SCRIPT_FILE" || {
+        echo "Error: Cannot append bundle to $SCRIPT_FILE" >&2
+        exit 1
+    }
+    echo "$install_cmd ${packages[*]}" >> "$SCRIPT_FILE" || {
+        echo "Error: Cannot append bundle command to $SCRIPT_FILE" >&2
+        exit 1
+    }
+    echo "Added $category bundle to $SCRIPT_FILE: ${packages[*]}"
+}
+
+# Function to reorder commands using dialog
+reorder_script() {
+    # Check if dialog is installed
+    if ! command -v dialog &>/dev/null; then
+        echo "Error: 'dialog' is required for reordering. Install it with 'sudo pacman -S dialog'."
+        exit 1
+    fi
+
+    # Read script, preserving header and grouping commands with comments
+    local header=()
+    local items=()
+    local current_item=()
+    local reading_header=1
+
+    while IFS= read -r line; do
+        if [ $reading_header -eq 1 ] && [[ "$line" =~ ^#!/bin/bash$ || "$line" =~ ^#.*$ ]]; then
+            header+=("$line")
+        else
+            reading_header=0
+            if [[ "$line" =~ ^#.*$ ]]; then
+                # Start a new item with the comment
+                if [ ${#current_item[@]} -gt 0 ]; then
+                    items+=("$(IFS=$'\n'; echo "${current_item[*]}")")
+                    current_item=()
+                fi
+                current_item+=("$line")
+            elif [ -n "$line" ]; then
+                # Add command to current item
+                current_item+=("$line")
+            fi
+        fi
+    done < "$SCRIPT_FILE"
+
+    # Add the last item if exists
+    if [ ${#current_item[@]} -gt 0 ]; then
+        items+=("$(IFS=$'\n'; echo "${current_item[*]}")")
+    fi
+
+    if [ ${#items[@]} -eq 0 ]; then
+        echo "Error: No commands to reorder in $SCRIPT_FILE."
+        exit 1
+    fi
+
+    # Create dialog menu items
+    local menu_items=()
+    for i in "${!items[@]}"; do
+        # Use first line of item (comment or command) for display
+        first_line=$(echo "${items[$i]}" | head -n 1)
+        menu_items+=("$i" "${first_line:0:50}")  # Truncate for display
+    done
+
+    # Temporary file for dialog output
+    local temp_file
+    temp_file=$(mktemp)
+
+    while true; do
+        # Display dialog menu
+        dialog --menu "Select a command to reorder (use +/= to move up, -/_ to move down, Enter to save, Esc to cancel)" 0 0 0 "${menu_items[@]}" 2> "$temp_file"
+        local status=$?
+        local selected
+        selected=$(cat "$temp_file")
+
+        if [ $status -ne 0 ]; then
+            echo "Reordering cancelled."
+            rm -f "$temp_file"
+            exit 0
+        fi
+
+        # Check for keypress (dialog doesn't handle + or - directly, so we use a second dialog)
+        local action
+        action=$(dialog --menu "Move command '$selected' (Enter to select, Esc to go back)" 0 0 0 \
+            "up" "Move up (+ or =)" \
+            "down" "Move down (- or _)" \
+            "done" "Save and exit" 2>&1 >/dev/tty)
+        local action_status=$?
+
+        if [ $action_status -ne 0 ]; then
+            continue  # Go back to main menu
+        fi
+
+        if [ "$action" = "done" ]; then
+            # Save reordered script
+            {
+                # Write header
+                for line in "${header[@]}"; do
+                    echo "$line"
+                done
+                # Write reordered items
+                for i in "${!menu_items[@]}"; do
+                    if [[ ${menu_items[$i]} =~ ^[0-9]+$ ]]; then
+                        echo -e "${items[${menu_items[$i]}]}\n"
+                    fi
+                done
+            } > "$SCRIPT_FILE" || {
+                echo "Error: Cannot write reordered script to $SCRIPT_FILE" >&2
+                rm -f "$temp_file"
+                exit 1
+            }
+            echo "Script reordered and saved to $SCRIPT_FILE"
+            rm -f "$temp_file"
+            exit 0
+        elif [ "$action" = "up" ] && [ "$selected" -gt 0 ]; then
+            # Swap with previous item
+            local temp=${menu_items[$((selected*2))]}
+            menu_items[$((selected*2))]=${menu_items[$(( (selected-1)*2 ))]}
+            menu_items[$(( (selected-1)*2 ))]=$temp
+            temp=${menu_items[$((selected*2+1))]}
+            menu_items[$((selected*2+1))]=${menu_items[$(( (selected-1)*2+1 ))]}
+            menu_items[$(( (selected-1)*2+1 ))]=$temp
+        elif [ "$action" = "down" ] && [ "$selected" -lt $(( ${#items[@]} - 1 )) ]; then
+            # Swap with next item
+            local temp=${menu_items[$((selected*2))]}
+            menu_items[$((selected*2))]=${menu_items[$(( (selected+1)*2 ))]}
+            menu_items[$(( (selected+1)*2 ))]=$temp
+            temp=${menu_items[$((selected*2+1))]}
+            menu_items[$((selected*2+1))]=${menu_items[$(( (selected+1)*2+1 ))]}
+            menu_items[$(( (selected+1)*2+1 ))]=$temp
+        fi
+    done
+}
+
+# Usage information
+usage() {
+    echo "Usage: rcr [options]"
+    echo "A tool to log commands and comments into a configuration script for Arch Linux."
+    echo
+    echo "Options:"
+    echo "  -i, --init                Initialize a new script"
+    echo "  -a, --add                 Add the last non-rcr command to the script"
+    echo "  -c, --comment             Prompt for and add a comment"
+    echo "  -n, --no-run              Prompt for a command to add without running it"
+    echo "  -b, --bundle CATEGORY     Bundle packages by category (arch, aur, flatpak)"
+    echo "  -r, --reorder             Interactively reorder commands in the script"
+    echo "  -e, --edit                Edit the script with \$EDITOR (default: vi)"
+    echo "  -p, --preview             Preview the script with less"
+    echo "  -f, --file FILE           Specify the script file (default: $DEFAULT_SCRIPT)"
+    echo "  -h, --help                Display this help message"
+    echo
+    echo "Examples:"
+    echo "  rcr --init                    # Initialize default script"
+    echo "  rcr -a                        # Add the last command"
+    echo "  rcr -c                        # Add a comment"
+    echo "  rcr -n                        # Add a command without running"
+    echo "  rcr -b arch i3 polybar        # Bundle Arch packages"
+    echo "  rcr -r                        # Reorder commands interactively"
+    echo "  rcr -f ~/my-script.sh -a      # Add to a custom script"
+}
+
+# Parse command-line options using getopt
+PARSED_OPTIONS=$(getopt -o iacnb:repf:h -l init,add,comment,no-run,bundle:,reorder,edit,preview,file:,help -n rcr -- "$@")
+if [ $? -ne 0 ]; then
+    echo "Invalid option. Use 'rcr -h' or 'rcr --help' for usage." >&2
+    exit 1
+fi
+
+eval set -- "$PARSED_OPTIONS"
+
+while true; do
+    case "$1" in
+        -f|--file)
+            SCRIPT_FILE="$2"
+            shift 2
+            ;;
+        -i|--init)
+            INIT=1
+            shift
+            ;;
+        -a|--add)
+            ADD_COMMAND=1
+            shift
+            ;;
+        -c|--comment)
+            ADD_COMMENT=1
+            shift
+            ;;
+        -n|--no-run)
+            NO_RUN=1
+            shift
+            ;;
+        -b|--bundle)
+            BUNDLE_CATEGORY="$2"
+            shift 2
+            BUNDLE=1
+            ;;
+        -r|--reorder)
+            REORDER=1
+            shift
+            ;;
+        -e|--edit)
+            EDIT=1
+            shift
+            ;;
+        -p|--preview)
+            PREVIEW=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            echo "Invalid option: $1. Use 'rcr -h' or 'rcr --help' for usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Collect bundle packages (remaining arguments after --)
+BUNDLE_PACKAGES=("$@")
+
+# If no options are provided, show usage
+if [ -z "$INIT" ] && [ -z "$ADD_COMMAND" ] && [ -z "$ADD_COMMENT" ] && [ -z "$NO_RUN" ] && [ -z "$BUNDLE" ] && [ -z "$REORDER" ] && [ -z "$EDIT" ] && [ -z "$PREVIEW" ]; then
+    usage
+    exit 0
+fi
+
+# Ensure the script directory exists
+mkdir -p "$(dirname "$SCRIPT_FILE")" || {
+    echo "Error: Cannot create directory for $SCRIPT_FILE" >&2
+    exit 1
+}
+
+# Handle initialization
+if [ -n "$INIT" ]; then
+    if [ -f "$SCRIPT_FILE" ]; then
+        read -p "Script $SCRIPT_FILE already exists. Overwrite? (y/n): " confirm
+        if [ "$confirm" != "y" ]; then
+            echo "Initialization aborted."
+            exit 0
+        fi
+    fi
+    {
+        echo "#!/bin/bash"
+        echo "# Rice Cooker Configuration Script"
+        echo "# Created on: $(date)"
+        echo "# By: $USER"
+    } > "$SCRIPT_FILE" || {
+        echo "Error: Cannot write to $SCRIPT_FILE" >&2
+        exit 1
+    }
+    chmod +x "$SCRIPT_FILE"
+    echo "Initialized $SCRIPT_FILE"
+    exit 0
+fi
+
+# Check if the script exists for other operations
+if [ ! -f "$SCRIPT_FILE" ]; then
+    echo "Error: Script $SCRIPT_FILE does not exist. Run 'rcr --init' first."
+    exit 1
+fi
+
+# Handle reordering
+if [ -n "$REORDER" ]; then
+    reorder_script
+fi
+
+# Handle adding a comment
+if [ -n "$ADD_COMMENT" ]; then
+    read -p "Enter comment: " COMMENT
+    echo "# $COMMENT" >> "$SCRIPT_FILE" || {
+        echo "Error: Cannot append comment to $SCRIPT_FILE" >&2
+        exit 1
+    }
+    echo "Added comment to $SCRIPT_FILE: $COMMENT"
+fi
+
+# Handle adding a command from history
+if [ -n "$ADD_COMMAND" ]; then
+    LAST_CMD=$(get_last_command)
+    if [ -z "$LAST_CMD" ]; then
+        echo "Error: No previous non-rcr command found to add."
+        exit 1
+    fi
+    echo "$LAST_CMD" >> "$SCRIPT_FILE" || {
+        echo "Error: Cannot append command to $SCRIPT_FILE" >&2
+        exit 1
+    }
+    echo "Added command to $SCRIPT_FILE: $LAST_CMD"
+fi
+
+# Handle adding a command without running
+if [ -n "$NO_RUN" ]; then
+    read -p "Enter command to add (will not be executed): " NO_RUN_CMD
+    if [ -z "$NO_RUN_CMD" ]; then
+        echo "Error: No command provided."
+        exit 1
+    fi
+    echo "$NO_RUN_CMD" >> "$SCRIPT_FILE" || {
+        echo "Error: Cannot append command to $SCRIPT_FILE" >&2
+        exit 1
+    }
+    echo "Added command to $SCRIPT_FILE: $NO_RUN_CMD"
+fi
+
+# Handle bundling packages
+if [ -n "$BUNDLE" ]; then
+    if [ ${#BUNDLE_PACKAGES[@]} -eq 0 ]; then
+        echo "Error: No packages specified for bundle. Usage: rcr -b <category> <package1> <package2>..." >&2
+        exit 1
+    fi
+    add_bundle "$BUNDLE_CATEGORY" "${BUNDLE_PACKAGES[@]}"
+fi
+
+# Handle editing the script
+if [ -n "$EDIT" ]; then
+    ${EDITOR:-vi} "$SCRIPT_FILE" || {
+        echo "Error: Failed to open editor for $SCRIPT_FILE" >&2
+        exit 1
+    }
+fi
+
+# Handle previewing the script
+if [ -n "$PREVIEW" ]; then
+    less "$SCRIPT_FILE" || {
+        echo "Error: Failed to preview $SCRIPT_FILE" >&2
+        exit 1
+    }
+fi
