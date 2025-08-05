@@ -1,7 +1,9 @@
 ```markdown
 # Rice Cooker (`rcr`)
 
-Rice Cooker (`rcr`) is a command-line tool for Arch Linux to create configuration scripts by logging commands, adding comments, bundling packages, and reordering entries. Perfect for ricing (customizing) your Arch setup with reproducible scripts.
+Rice Cooker (`rcr`) is a vibe-coded command-line tool for Arch Linux to create configuration scripts by logging commands, adding comments, bundling packages, and reordering entries.
+Perfect for ricing (customizing) your Arch setup with reproducible scripts.
+Warning: This has not been extensively tested, is still in its early stages and will be buggy. I'm currently trying it out on a virtualbox installation.
 
 ## Features
 - Log executed commands (`-a`) or manually add commands (`-n`).
